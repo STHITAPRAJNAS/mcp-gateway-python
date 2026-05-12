@@ -1,0 +1,64 @@
+# Sample MCP Gateway configuration.
+# Override the path with the env var MCP_GATEWAY_CONFIG_PATH.
+
+upstreams:
+  - id: pg
+    name: Postgres MCP
+    base_url: http://postgres-mcp:8000
+    transport: http
+    tags: [data, sql]
+    mutable_tools: [execute_sql, write_row, delete_row]
+
+  - id: gh
+    name: GitHub MCP
+    base_url: http://github-mcp:8000
+    transport: http
+    auth_header: Authorization
+    auth_token: "Bearer ${GITHUB_TOKEN}"
+    tags: [scm, github]
+    mutable_tools: [create_issue, create_pr, merge_pr]
+
+  - id: search
+    name: Web Search MCP
+    base_url: http://search-mcp:8000
+    transport: http
+    tags: [search, readonly]
+
+auth:
+  enabled: true
+  mutable_allowed_agents:
+    - ops-bot
+    - release-agent
+  agent_permissions:
+    readonly-agent:
+      - pg.list_tables
+      - pg.describe_table
+      - search.*
+    ops-bot:
+      - "*"
+
+redaction:
+  enabled: true
+  redact_requests: true
+  redact_responses: true
+  score_threshold: 0.5
+  entities:
+    - EMAIL_ADDRESS
+    - PHONE_NUMBER
+    - CREDIT_CARD
+    - US_SSN
+    - IP_ADDRESS
+
+guardrails:
+  enabled: true
+  rules:
+    - name: no-destructive-sql
+      tool: execute_sql
+      forbidden_substrings: ["DROP TABLE", "TRUNCATE", "DELETE FROM"]
+      forbidden_regex:
+        - "(?i)\\bDROP\\s+DATABASE\\b"
+    - name: bounded-pagination
+      tool: "*"
+      numeric_ranges:
+        limit: { min: 1, max: 1000 }
+        offset: { min: 0, max: 100000 }
