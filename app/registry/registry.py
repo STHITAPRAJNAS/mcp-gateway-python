@@ -1,9 +1,4 @@
-"""Dynamic registry of upstream MCP servers.
-
-The registry is the single source of truth for which servers exist and how to
-reach them. It is mutable at runtime — servers can be added, disabled, or
-removed without restarting the gateway.
-"""
+"""Dynamic registry of upstream MCP servers."""
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +8,11 @@ from typing import Any
 
 import httpx
 
-from app.config import UpstreamServer
+from app.config import CircuitBreakerPolicy, UpstreamServer
 from app.models.mcp import ToolDefinition
 from app.observability.logging import get_logger
 from app.observability.metrics import REGISTERED_SERVERS, REGISTERED_TOOLS
+from app.transport.circuit_breaker import CircuitBreaker, CircuitBreakerRegistry
 from app.transport.mcp_client import MCPClient, UpstreamError
 
 log = get_logger("registry")
@@ -33,19 +29,19 @@ class RegistryEntry:
 
 
 class ServerRegistry:
-    """Threadsafe (asyncio) registry of fast-mcp upstreams.
-
-    Tools are namespaced with the server id (or explicit prefix) to avoid
-    collisions when aggregating across many servers.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, cb_policy: CircuitBreakerPolicy | None = None) -> None:
         self._entries: dict[str, RegistryEntry] = {}
         self._lock = asyncio.Lock()
-        # Shared HTTP client across all upstreams for connection pooling.
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+        )
+        _cb_policy = cb_policy or CircuitBreakerPolicy()
+        self._cb_registry = CircuitBreakerRegistry(
+            enabled=_cb_policy.enabled,
+            failure_threshold=_cb_policy.failure_threshold,
+            recovery_timeout=_cb_policy.recovery_timeout,
+            probe_successes=_cb_policy.probe_successes,
         )
 
     # ------------- lifecycle -------------
@@ -62,9 +58,9 @@ class ServerRegistry:
     async def register(self, server: UpstreamServer, *, sync: bool = True) -> RegistryEntry:
         async with self._lock:
             if server.id in self._entries:
-                # Replace existing entry; close old client.
                 await self._entries[server.id].client.close()
-            client = MCPClient(server, http=self._http)
+            cb = self._cb_registry.get(server.id) if self._cb_registry.enabled else None
+            client = MCPClient(server, http=self._http, circuit_breaker=cb)
             entry = RegistryEntry(server=server, client=client)
             self._entries[server.id] = entry
             REGISTERED_SERVERS.set(len(self._entries))
@@ -105,14 +101,12 @@ class ServerRegistry:
         return [e for e in self._entries.values() if e.server.enabled]
 
     def find_by_qualified_tool(self, qualified_name: str) -> tuple[RegistryEntry, str] | None:
-        """Resolve a qualified tool name (e.g. 'pg.query') to (entry, raw_tool_name)."""
         if "." in qualified_name:
             prefix, _, raw = qualified_name.partition(".")
             for entry in self._entries.values():
                 effective_prefix = entry.server.tool_prefix or entry.server.id
                 if effective_prefix == prefix:
                     return entry, raw
-        # Fall back: search by bare tool name (must be unique).
         matches = [
             (entry, qualified_name)
             for entry in self._entries.values()
@@ -121,6 +115,9 @@ class ServerRegistry:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def circuit_breaker_states(self) -> dict[str, dict]:
+        return self._cb_registry.all_states()
 
     # ------------- sync -------------
 
@@ -162,6 +159,7 @@ class ServerRegistry:
         REGISTERED_TOOLS.set(total)
 
     def to_dict(self) -> dict[str, Any]:
+        cb_states = self.circuit_breaker_states()
         return {
             sid: {
                 "id": e.server.id,
@@ -173,6 +171,7 @@ class ServerRegistry:
                 "last_synced": e.last_synced.isoformat() if e.last_synced else None,
                 "last_error": e.last_error,
                 "tags": e.server.tags,
+                "circuit_breaker": cb_states.get(sid, {}),
             }
             for sid, e in self._entries.items()
         }

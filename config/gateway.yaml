@@ -1,6 +1,3 @@
-# Sample MCP Gateway configuration.
-# Override the path with the env var MCP_GATEWAY_CONFIG_PATH.
-
 upstreams:
   - id: pg
     name: Postgres MCP
@@ -14,7 +11,7 @@ upstreams:
     base_url: http://github-mcp:8000
     transport: http
     auth_header: Authorization
-    auth_token: "Bearer ${GITHUB_TOKEN}"
+    auth_token: "Bearer changeme"
     tags: [scm, github]
     mutable_tools: [create_issue, create_pr, merge_pr]
 
@@ -26,6 +23,17 @@ upstreams:
 
 auth:
   enabled: true
+  oidc:
+    enabled: false               # set true + configure below for JWT/OIDC
+    algorithms: [RS256]
+    jwks_url: "https://idp.example.com/.well-known/jwks.json"
+    issuer: "https://idp.example.com"
+    audience: "mcp-gateway"
+    agent_id_claim: sub
+    jwks_cache_ttl: 300
+    # For HS256 (internal services):
+    # algorithms: [HS256]
+    # secret: "supersecret"
   mutable_allowed_agents:
     - ops-bot
     - release-agent
@@ -33,7 +41,7 @@ auth:
     readonly-agent:
       - pg.list_tables
       - pg.describe_table
-      - search.*
+      - search.query
     ops-bot:
       - "*"
 
@@ -62,3 +70,28 @@ guardrails:
       numeric_ranges:
         limit: { min: 1, max: 1000 }
         offset: { min: 0, max: 100000 }
+    - name: no-secret-keys
+      tool: "*"
+      forbidden_regex:
+        - "sk-[A-Za-z0-9]{10,}"
+
+rate_limiting:
+  enabled: true
+  default_agent_rate: 10.0      # tokens/sec per agent (global)
+  default_agent_burst: 20.0
+  default_tool_rate: 5.0        # tokens/sec per (agent, tool)
+  default_tool_burst: 10.0
+  agents:
+    ops-bot:
+      agent_rate: 50.0
+      agent_burst: 100.0
+  tools:
+    pg.execute_sql:
+      rate: 2.0
+      burst: 4.0
+
+circuit_breaker:
+  enabled: true
+  failure_threshold: 5          # consecutive failures before OPEN
+  recovery_timeout: 30.0        # seconds to wait before probing
+  probe_successes: 2            # successes in HALF_OPEN to CLOSE

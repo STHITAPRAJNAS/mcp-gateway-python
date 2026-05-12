@@ -1,20 +1,20 @@
-"""Mock authorization layer.
+"""Authorization layer: OIDC JWT validation + ACL enforcement.
 
-This implements a deliberately simple, swappable authorizer:
-  * An agent is identified by an `X-Agent-Id` header.
-  * Mutable tools require the agent to be listed in `auth.mutable_allowed_agents`.
-  * Optional per-agent allow-lists let policies further restrict which tools an
-    agent may invoke.
+Identification flow:
+  1. If a Bearer token is present in the Authorization header and OIDC is
+     enabled, validate it and extract the agent_id from the configured claim.
+  2. Otherwise fall back to the X-Agent-Id header (useful for service accounts
+     and development environments).
 
-In production this would be replaced with a JWT / OIDC verifier and an
-OPA / Cedar policy decision point — the shape of `authorize_tool_call` is the
-extension seam.
+ACL enforcement is unchanged from the original design — the seam between
+identity (who is this?) and authorisation (what may they do?) is clean.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from app.config import AuthPolicy
+from app.middleware.oidc import OIDCConfig, OIDCError, OIDCValidator
 from app.observability.logging import get_logger
 from app.observability.metrics import AUTH_DENIALS_TOTAL
 
@@ -39,13 +39,49 @@ class AgentPrincipal:
 class Authorizer:
     def __init__(self, policy: AuthPolicy) -> None:
         self.policy = policy
+        oidc_cfg = OIDCConfig(
+            enabled=policy.oidc.enabled,
+            algorithms=list(policy.oidc.algorithms),
+            jwks_url=policy.oidc.jwks_url,
+            issuer=policy.oidc.issuer,
+            audience=policy.oidc.audience,
+            secret=policy.oidc.secret,
+            agent_id_claim=policy.oidc.agent_id_claim,
+            jwks_cache_ttl=policy.oidc.jwks_cache_ttl,
+        )
+        self._oidc: OIDCValidator | None = (
+            OIDCValidator(oidc_cfg) if oidc_cfg.enabled else None
+        )
 
-    def identify(self, agent_id: str | None) -> AgentPrincipal:
+    async def identify(
+        self,
+        agent_id_header: str | None,
+        bearer_token: str | None = None,
+    ) -> AgentPrincipal:
+        """Resolve a request to an AgentPrincipal."""
         if not self.policy.enabled:
-            return AgentPrincipal(agent_id=agent_id or "anonymous", permissions=("*",))
-        if not agent_id:
+            return AgentPrincipal(
+                agent_id=agent_id_header or "anonymous", permissions=("*",)
+            )
+
+        # --- OIDC path ---
+        if self._oidc is not None and bearer_token:
+            try:
+                payload = await self._oidc.validate(bearer_token)
+                agent_id = self._oidc.extract_agent_id(payload)
+            except OIDCError as exc:
+                AUTH_DENIALS_TOTAL.labels(reason="invalid_token").inc()
+                raise AuthorizationError(str(exc), reason="invalid_token") from exc
+        # --- Header fallback ---
+        elif agent_id_header:
+            agent_id = agent_id_header
+        else:
             AUTH_DENIALS_TOTAL.labels(reason="missing_agent_id").inc()
-            raise AuthorizationError("agent id required", reason="missing_agent_id")
+            raise AuthorizationError(
+                "agent id required (X-Agent-Id header or Bearer token)",
+                reason="missing_agent_id",
+            )
+
         perms = tuple(self.policy.agent_permissions.get(agent_id, []))
         return AgentPrincipal(agent_id=agent_id, permissions=perms)
 
@@ -54,7 +90,6 @@ class Authorizer:
     ) -> None:
         if not self.policy.enabled:
             return
-        # Mutable tools require explicit allow-listing.
         if mutable and principal.agent_id not in self.policy.mutable_allowed_agents:
             AUTH_DENIALS_TOTAL.labels(reason="mutable_forbidden").inc()
             log.warning(
@@ -66,8 +101,6 @@ class Authorizer:
                 f"agent '{principal.agent_id}' may not invoke mutable tool '{qualified_name}'",
                 reason="mutable_forbidden",
             )
-        # Per-agent ACL: if any permissions are configured for this agent and "*"
-        # is not present, require an explicit match against tool or qualified name.
         if principal.permissions and "*" not in principal.permissions:
             if not (principal.can(tool_name) or principal.can(qualified_name)):
                 AUTH_DENIALS_TOTAL.labels(reason="acl_denied").inc()

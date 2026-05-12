@@ -11,11 +11,13 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.dependencies import (
+    get_audit,
     get_orchestrator,
     get_principal,
     get_registry,
     require_api_key,
 )
+from app.audit.store import AuditStore
 from app.config import UpstreamServer, get_settings
 from app.middleware.auth import AgentPrincipal
 from app.models.mcp import (
@@ -58,6 +60,8 @@ async def metrics() -> Response:
 # ----- Authenticated router -----
 api_router = APIRouter(dependencies=[Depends(require_api_key)])
 
+
+# --- Registry management ---
 
 @api_router.get("/v1/registry/servers", tags=["registry"])
 async def list_servers(registry: ServerRegistry = Depends(get_registry)) -> dict[str, Any]:
@@ -108,9 +112,7 @@ async def sync_server(
     }
 
 
-@api_router.post(
-    "/v1/registry/servers/{server_id}/enabled", tags=["registry"]
-)
+@api_router.post("/v1/registry/servers/{server_id}/enabled", tags=["registry"])
 async def set_enabled(
     server_id: str,
     enabled: bool = Query(...),
@@ -121,6 +123,15 @@ async def set_enabled(
         raise HTTPException(status_code=404, detail=f"server '{server_id}' not found")
     return {"server_id": server_id, "enabled": enabled}
 
+
+@api_router.get("/v1/registry/circuit-breakers", tags=["registry"])
+async def circuit_breaker_states(
+    registry: ServerRegistry = Depends(get_registry),
+) -> dict[str, Any]:
+    return {"circuit_breakers": registry.circuit_breaker_states()}
+
+
+# --- Tool manifest & calls ---
 
 @api_router.get("/v1/tools", response_model=ToolManifest, tags=["tools"])
 async def list_tools(
@@ -153,13 +164,7 @@ async def call_tool_stream(
     orchestrator: Orchestrator = Depends(get_orchestrator),
     principal: AgentPrincipal = Depends(get_principal),
 ) -> EventSourceResponse:
-    """Server-Sent Events variant for real-time tool invocation.
-
-    Emits a `start` event, an optional `progress` heartbeat every 5s while the
-    upstream call is in flight, and either a `result` or `error` terminating
-    event. Useful for long-running tools and for keeping reverse proxies from
-    closing idle connections.
-    """
+    """SSE variant: emits start → progress (heartbeat) → result | error."""
     settings = get_settings()
 
     async def event_source():
@@ -196,9 +201,31 @@ async def call_tool_stream(
             return
         yield {"event": "result", "data": result.model_dump_json()}
 
-    # Wider ping interval keeps connections warm without flooding clients.
     return EventSourceResponse(
         event_source(),
         ping=15,
         headers={"X-Gateway-Timeout": str(settings.request_timeout_seconds)},
     )
+
+
+# --- Audit log ---
+
+@api_router.get("/v1/audit", tags=["audit"])
+async def query_audit(
+    agent_id: str | None = Query(default=None),
+    server_id: str | None = Query(default=None),
+    tool_name: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    audit: AuditStore = Depends(get_audit),
+) -> dict[str, Any]:
+    rows = await audit.query(
+        agent_id=agent_id,
+        server_id=server_id,
+        tool_name=tool_name,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return {"entries": rows, "count": len(rows)}

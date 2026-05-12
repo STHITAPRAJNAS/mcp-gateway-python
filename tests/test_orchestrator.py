@@ -15,7 +15,7 @@ async def test_manifest_tag_filter(orchestrator):
 
 
 async def test_call_tool_routes_by_qualified_name(orchestrator):
-    principal = orchestrator.authorizer.identify("ops-bot")
+    principal = await orchestrator.authorizer.identify("ops-bot", None)
     result = await orchestrator.call_tool(
         principal=principal, name="pg.list_tables", arguments={}
     )
@@ -25,7 +25,7 @@ async def test_call_tool_routes_by_qualified_name(orchestrator):
 
 
 async def test_mutable_blocked_for_unauthorized_agent(orchestrator):
-    principal = orchestrator.authorizer.identify("readonly")
+    principal = await orchestrator.authorizer.identify("readonly", None)
     with pytest.raises(Exception) as exc:
         await orchestrator.call_tool(
             principal=principal,
@@ -36,7 +36,7 @@ async def test_mutable_blocked_for_unauthorized_agent(orchestrator):
 
 
 async def test_guardrail_blocks_destructive_sql(orchestrator):
-    principal = orchestrator.authorizer.identify("ops-bot")
+    principal = await orchestrator.authorizer.identify("ops-bot", None)
     with pytest.raises(Exception):
         await orchestrator.call_tool(
             principal=principal,
@@ -46,7 +46,7 @@ async def test_guardrail_blocks_destructive_sql(orchestrator):
 
 
 async def test_response_pii_is_redacted(orchestrator):
-    principal = orchestrator.authorizer.identify("ops-bot")
+    principal = await orchestrator.authorizer.identify("ops-bot", None)
     result = await orchestrator.call_tool(
         principal=principal,
         name="pg.execute_sql",

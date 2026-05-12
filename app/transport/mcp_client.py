@@ -1,14 +1,10 @@
 """Asynchronous JSON-RPC client for talking to fast-mcp upstream servers.
 
-Supports two transports:
-  * "http": plain JSON-RPC over POST (fast-mcp's `streamable-http` content-type),
-  * "sse": JSON-RPC POSTed to /messages with responses returned on an SSE stream.
-
-For enterprise resilience we layer:
-  * Connection pooling via a shared httpx.AsyncClient,
-  * Exponential-backoff retries on transient network errors,
-  * Per-request timeouts and cancellation,
-  * Structured tracing via structlog.
+Integrates:
+  * Circuit breaker — each MCPClient holds a reference to a CircuitBreaker and
+    gates every call through it.
+  * Exponential-backoff retries on transient network errors.
+  * Per-request timeouts and cancellation.
 """
 from __future__ import annotations
 
@@ -27,6 +23,7 @@ from tenacity import (
 from app.config import UpstreamServer
 from app.models.mcp import JSONRPCError, JSONRPCRequest, JSONRPCResponse
 from app.observability.logging import get_logger
+from app.transport.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 log = get_logger("mcp.client")
 
@@ -43,7 +40,12 @@ class UpstreamError(Exception):
 class MCPClient:
     """Stateful client for a single upstream MCP server."""
 
-    def __init__(self, server: UpstreamServer, http: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        server: UpstreamServer,
+        http: httpx.AsyncClient | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
         self.server = server
         self._id_counter = itertools.count(1)
         self._owns_http = http is None
@@ -51,6 +53,7 @@ class MCPClient:
             timeout=httpx.Timeout(server.timeout_seconds),
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
         )
+        self._cb = circuit_breaker
 
     async def close(self) -> None:
         if self._owns_http:
@@ -69,38 +72,59 @@ class MCPClient:
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
     ) -> Any:
         """Issue a JSON-RPC request and return the `result` value."""
+        # Circuit-breaker gate — raises CircuitOpenError if OPEN.
+        if self._cb is not None:
+            try:
+                await self._cb.before_call()
+            except CircuitOpenError:
+                raise UpstreamError(
+                    f"circuit open for server '{self.server.id}' — try again later",
+                    code=-32001,
+                )
+
         payload = JSONRPCRequest(id=self._next_id(), method=method, params=params or {})
         url = str(self.server.base_url).rstrip("/") + "/"
 
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=0.2, min=0.2, max=2.0),
-            retry=retry_if_exception_type(
-                (httpx.TransportError, httpx.RemoteProtocolError, asyncio.TimeoutError)
-            ),
-            reraise=True,
-        ):
-            with attempt:
-                log.debug(
-                    "mcp.upstream.request",
-                    server_id=self.server.id,
-                    method=method,
-                    attempt=attempt.retry_state.attempt_number,
-                )
-                resp = await self._http.post(
-                    url,
-                    json=payload.model_dump(mode="json"),
-                    headers=self._headers(),
-                    timeout=timeout or self.server.timeout_seconds,
-                )
-                resp.raise_for_status()
-                rpc = JSONRPCResponse.model_validate(resp.json())
-                if rpc.error is not None:
-                    err: JSONRPCError = rpc.error
-                    raise UpstreamError(err.message, code=err.code, data=err.data)
-                return rpc.result
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=0.2, min=0.2, max=2.0),
+                retry=retry_if_exception_type(
+                    (httpx.TransportError, httpx.RemoteProtocolError, asyncio.TimeoutError)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    log.debug(
+                        "mcp.upstream.request",
+                        server_id=self.server.id,
+                        method=method,
+                        attempt=attempt.retry_state.attempt_number,
+                    )
+                    resp = await self._http.post(
+                        url,
+                        json=payload.model_dump(mode="json"),
+                        headers=self._headers(),
+                        timeout=timeout or self.server.timeout_seconds,
+                    )
+                    resp.raise_for_status()
+                    rpc = JSONRPCResponse.model_validate(resp.json())
+                    if rpc.error is not None:
+                        err: JSONRPCError = rpc.error
+                        raise UpstreamError(err.message, code=err.code, data=err.data)
+                    result = rpc.result
+        except (httpx.TransportError, httpx.HTTPStatusError, UpstreamError) as exc:
+            if self._cb is not None:
+                await self._cb.on_failure()
+            raise
+        except Exception:
+            if self._cb is not None:
+                await self._cb.on_failure()
+            raise
 
-        raise UpstreamError("retry loop exhausted without producing a result")
+        if self._cb is not None:
+            await self._cb.on_success()
+        return result
 
     # ------------------- High-level MCP operations -------------------
 
@@ -122,7 +146,6 @@ class MCPClient:
             await self.request("ping")
             return True
         except UpstreamError as exc:
-            # Many MCP servers don't implement ping; fall back to tools/list.
             if exc.code == -32601:
                 try:
                     await self.list_tools()

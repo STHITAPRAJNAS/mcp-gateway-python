@@ -5,16 +5,20 @@ from typing import Any
 
 import pytest
 
+from app.audit.store import AuditStore
 from app.config import (
     AuthPolicy,
     GatewayConfig,
     GuardrailsPolicy,
+    OIDCPolicy,
+    RateLimitingPolicy,
     RedactionPolicy,
     SafetyRule,
     UpstreamServer,
 )
 from app.guardrails.safety import SafetyFilter
 from app.middleware.auth import Authorizer
+from app.middleware.ratelimit import RateLimiter, RateLimiterConfig
 from app.middleware.redaction import Redactor
 from app.models.mcp import ToolDefinition
 from app.orchestrator.orchestrator import Orchestrator
@@ -29,7 +33,7 @@ class FakeClient:
         self._responses = responses or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def close(self) -> None:  # pragma: no cover
+    async def close(self) -> None:
         return None
 
     async def list_tools(self) -> list[dict[str, Any]]:
@@ -49,10 +53,8 @@ class FakeClient:
 
 
 async def _install_fake(registry: ServerRegistry, server: UpstreamServer, fake: FakeClient) -> None:
-    """Bypass network and inject a FakeClient into the registry."""
     entry = RegistryEntry(server=server, client=fake)  # type: ignore[arg-type]
     registry._entries[server.id] = entry  # noqa: SLF001
-    # Reuse sync logic to build ToolDefinitions.
     raw_tools = await fake.list_tools()
     prefix = server.tool_prefix or server.id
     mutable_set = set(server.mutable_tools)
@@ -73,6 +75,7 @@ def gateway_config() -> GatewayConfig:
         upstreams=[],
         auth=AuthPolicy(
             enabled=True,
+            oidc=OIDCPolicy(enabled=False),
             mutable_allowed_agents=["ops-bot"],
             agent_permissions={"readonly": ["search.query"]},
         ),
@@ -96,7 +99,15 @@ def gateway_config() -> GatewayConfig:
 
 
 @pytest.fixture
-async def orchestrator(gateway_config):
+async def audit_store(tmp_path):
+    store = AuditStore(f"sqlite+aiosqlite:///{tmp_path}/audit_test.db")
+    await store.start()
+    yield store
+    await store.stop()
+
+
+@pytest.fixture
+async def orchestrator(gateway_config, audit_store):
     reg = ServerRegistry()
     pg = UpstreamServer(
         id="pg",
@@ -130,11 +141,14 @@ async def orchestrator(gateway_config):
             responses={"query": {"hits": ["doc1"]}},
         ),
     )
+    rl = RateLimiter(RateLimiterConfig(enabled=False))
     orch = Orchestrator(
         reg,
         Authorizer(gateway_config.auth),
         Redactor(gateway_config.redaction),
         SafetyFilter(gateway_config.guardrails),
+        rate_limiter=rl,
+        audit=audit_store,
     )
     yield orch
     await reg.close()

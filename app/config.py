@@ -1,6 +1,7 @@
 """Gateway configuration loaded from env + YAML."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field as dc_field
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -22,19 +23,29 @@ class UpstreamServer(BaseModel):
     timeout_seconds: float = 30.0
     tags: list[str] = Field(default_factory=list)
     enabled: bool = True
-    # Optional explicit tool-name prefix; default uses server id
     tool_prefix: str | None = None
-    # Tools considered mutable for this server (e.g. write/delete operations)
     mutable_tools: list[str] = Field(default_factory=list)
 
 
+class OIDCPolicy(BaseModel):
+    """JWT / OIDC authentication policy."""
+
+    enabled: bool = False
+    algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
+    jwks_url: str | None = None
+    issuer: str | None = None
+    audience: str | None = None
+    secret: str | None = None
+    agent_id_claim: str = "sub"
+    jwks_cache_ttl: float = 300.0
+
+
 class AuthPolicy(BaseModel):
-    """Mock authorization policy."""
+    """Authorization policy (ACL + OIDC)."""
 
     enabled: bool = True
-    # agent_id -> list of allowed actions, "*" = all
+    oidc: OIDCPolicy = OIDCPolicy()
     agent_permissions: dict[str, list[str]] = Field(default_factory=dict)
-    # agent_ids permitted to invoke mutable tools
     mutable_allowed_agents: list[str] = Field(default_factory=list)
 
 
@@ -51,7 +62,6 @@ class RedactionPolicy(BaseModel):
         ]
     )
     score_threshold: float = 0.5
-    # Redact request arguments before forwarding, and responses before returning
     redact_requests: bool = True
     redact_responses: bool = True
     replacement: str = "<REDACTED:{entity}>"
@@ -59,13 +69,9 @@ class RedactionPolicy(BaseModel):
 
 class SafetyRule(BaseModel):
     name: str
-    # Match against tool name; "*" matches any
     tool: str = "*"
-    # Disallowed substrings (case-insensitive) in any string argument
     forbidden_substrings: list[str] = Field(default_factory=list)
-    # Per-argument numeric ranges: {"arg_name": {"min": 0, "max": 100}}
     numeric_ranges: dict[str, dict[str, float]] = Field(default_factory=dict)
-    # Regex patterns argument values must NOT match
     forbidden_regex: list[str] = Field(default_factory=list)
 
 
@@ -74,11 +80,30 @@ class GuardrailsPolicy(BaseModel):
     rules: list[SafetyRule] = Field(default_factory=list)
 
 
+class RateLimitingPolicy(BaseModel):
+    enabled: bool = True
+    default_agent_rate: float = 10.0
+    default_agent_burst: float = 20.0
+    default_tool_rate: float = 5.0
+    default_tool_burst: float = 10.0
+    agents: dict[str, dict[str, float]] = Field(default_factory=dict)
+    tools: dict[str, dict[str, float]] = Field(default_factory=dict)
+
+
+class CircuitBreakerPolicy(BaseModel):
+    enabled: bool = True
+    failure_threshold: int = 5
+    recovery_timeout: float = 30.0
+    probe_successes: int = 2
+
+
 class GatewayConfig(BaseModel):
     upstreams: list[UpstreamServer] = Field(default_factory=list)
     auth: AuthPolicy = AuthPolicy()
     redaction: RedactionPolicy = RedactionPolicy()
     guardrails: GuardrailsPolicy = GuardrailsPolicy()
+    rate_limiting: RateLimitingPolicy = RateLimitingPolicy()
+    circuit_breaker: CircuitBreakerPolicy = CircuitBreakerPolicy()
 
     @field_validator("upstreams")
     @classmethod
@@ -106,11 +131,13 @@ class Settings(BaseSettings):
     config_path: str = "config/gateway.yaml"
     metrics_path: str = "/metrics"
     request_timeout_seconds: float = 60.0
-    # JWT/auth header used to identify the calling agent
     agent_id_header: str = "X-Agent-Id"
     api_key_header: str = "X-API-Key"
-    # If set, require this API key on all calls
     api_key: str | None = None
+    # Audit log database URL (aiosqlite for SQLite, asyncpg for Postgres)
+    audit_db_url: str = "sqlite+aiosqlite:///audit.db"
+    # Background health sweep interval (seconds, 0 = disabled)
+    health_sweep_interval: float = 60.0
 
     def load_gateway_config(self) -> GatewayConfig:
         path = Path(self.config_path)

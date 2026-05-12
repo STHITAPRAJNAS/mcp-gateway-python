@@ -1,19 +1,24 @@
 """End-to-end API tests using FastAPI TestClient with a fake registry."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.audit.store import AuditStore
 from app.config import (
     AuthPolicy,
     GatewayConfig,
     GuardrailsPolicy,
+    OIDCPolicy,
     RedactionPolicy,
     UpstreamServer,
 )
 from app.guardrails.safety import SafetyFilter
 from app.main import create_app
 from app.middleware.auth import Authorizer
+from app.middleware.ratelimit import RateLimiter, RateLimiterConfig
 from app.middleware.redaction import Redactor
 from app.orchestrator.orchestrator import Orchestrator
 from app.registry.registry import ServerRegistry
@@ -22,28 +27,33 @@ from tests.conftest import FakeClient, _install_fake
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    # Force the lifespan to find no upstreams so it doesn't try real HTTP.
     monkeypatch.setenv("MCP_GATEWAY_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("MCP_GATEWAY_AUDIT_DB_URL", f"sqlite+aiosqlite:///{tmp_path}/api_test.db")
     from app.config import get_settings
 
     get_settings.cache_clear()
 
     app = create_app()
     with TestClient(app) as c:
-        # Replace the orchestrator/registry built by the lifespan with our fakes.
         cfg = GatewayConfig(
             upstreams=[],
-            auth=AuthPolicy(enabled=True, mutable_allowed_agents=["ops-bot"]),
+            auth=AuthPolicy(
+                enabled=True,
+                oidc=OIDCPolicy(enabled=False),
+                mutable_allowed_agents=["ops-bot"],
+            ),
             redaction=RedactionPolicy(enabled=False),
             guardrails=GuardrailsPolicy(enabled=False),
         )
         registry = ServerRegistry()
         authorizer = Authorizer(cfg.auth)
+        rl = RateLimiter(RateLimiterConfig(enabled=False))
+        audit = app.state.audit  # reuse the one started in lifespan
         orch = Orchestrator(
-            registry, authorizer, Redactor(cfg.redaction), SafetyFilter(cfg.guardrails)
+            registry, authorizer, Redactor(cfg.redaction), SafetyFilter(cfg.guardrails),
+            rate_limiter=rl, audit=audit,
         )
         srv = UpstreamServer(id="pg", name="pg", base_url="http://x.invalid", mutable_tools=[])
-        import asyncio
 
         loop = asyncio.new_event_loop()
         try:
@@ -104,3 +114,15 @@ def test_call_tool_success(client):
     body = r.json()
     assert body["server_id"] == "pg"
     assert body["tool"] == "list_tables"
+
+
+def test_circuit_breaker_states_endpoint(client):
+    r = client.get("/v1/registry/circuit-breakers")
+    assert r.status_code == 200
+    assert "circuit_breakers" in r.json()
+
+
+def test_audit_endpoint_accessible(client):
+    r = client.get("/v1/audit")
+    assert r.status_code == 200
+    assert "entries" in r.json()
