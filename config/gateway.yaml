@@ -95,3 +95,34 @@ circuit_breaker:
   failure_threshold: 5          # consecutive failures before OPEN
   recovery_timeout: 30.0        # seconds to wait before probing
   probe_successes: 2            # successes in HALF_OPEN to CLOSE
+
+naming:
+  strategy: prefix_always    # prefix_always | prefix_on_conflict | bare
+  on_conflict: warn          # warn | error | suffix
+
+# Example per-server auth configs:
+#
+# Static with env-var expansion:
+#   server_auth:
+#     strategy: static
+#     header: Authorization
+#     token: "${GITHUB_TOKEN}"
+#
+# Read from env at call time (for rotated secrets):
+#   server_auth:
+#     strategy: env
+#     header: Authorization
+#     env_var: POSTGRES_MCP_TOKEN
+#
+# OAuth2 client_credentials with auto-refresh:
+#   server_auth:
+#     strategy: oauth2
+#     header: Authorization
+#     oauth2_token_url: https://auth.example.com/oauth/token
+#     oauth2_client_id: mcp-gateway
+#     oauth2_client_secret_env: CRM_CLIENT_SECRET
+#     oauth2_scope: crm.read crm.write
+#     oauth2_refresh_buffer: 60
+#
+# Forward calling agent id to upstream for server-side attribution:
+#     forward_agent_id_header: X-Forwarded-Agent

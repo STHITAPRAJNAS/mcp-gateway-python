@@ -1,16 +1,17 @@
 """MCP-protocol-compliant client using the official MCP Python SDK.
 
 Each MCPClient manages a single upstream fast-mcp server. On first use it:
-  1. Opens a streamable-HTTP (2025-03-26) or SSE (2024-11-05) connection.
-  2. Runs the `initialize` / `notifications/initialized` handshake.
-  3. Caches the live ClientSession for re-use.
+  1. Resolves auth headers via the configured AuthProvider (static/env/oauth2).
+  2. Opens a streamable-HTTP (2025-03-26) or SSE (2024-11-05) connection.
+  3. Runs the `initialize` / `notifications/initialized` handshake.
+  4. Caches the live ClientSession for re-use across calls.
 
-On connection failure (or after a circuit-breaker reset) the session is torn
-down and re-established on the next call.
+Auth headers are re-fetched on every session open so that rotated credentials
+(env injection, OAuth token refresh) are always picked up.
 
-Transport selection is driven by `UpstreamServer.transport`:
-  "streamable-http" (default) → mcp.client.streamable_http
-  "sse"                        → mcp.client.sse
+Per-call agent identity forwarding: if `server_auth.forward_agent_id_header`
+is set, the calling agent's id is forwarded to the upstream so its audit logs
+can attribute the call to the originating agent.
 """
 from __future__ import annotations
 
@@ -38,14 +39,13 @@ from tenacity import (
 
 from app.config import UpstreamServer
 from app.observability.logging import get_logger
+from app.transport.auth_provider import AuthProvider, AuthProviderError, build_auth_provider
 from app.transport.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 log = get_logger("mcp.client")
 
 
 class UpstreamError(Exception):
-    """Raised when an upstream MCP server returns an error or transport fault."""
-
     def __init__(self, message: str, code: int = -32000, data: Any = None) -> None:
         super().__init__(message)
         self.code = code
@@ -53,12 +53,7 @@ class UpstreamError(Exception):
 
 
 def _extract_content(result: CallToolResult) -> Any:
-    """Flatten MCP content blocks into a JSON-serialisable value.
-
-    Single text block → plain string.
-    Multiple / mixed blocks → list of dicts.
-    isError → raise UpstreamError with the text payload.
-    """
+    """Flatten MCP content blocks into a JSON-serialisable value."""
     blocks = result.content or []
     parts: list[Any] = []
     for block in blocks:
@@ -80,11 +75,7 @@ def _extract_content(result: CallToolResult) -> Any:
 
 
 class MCPClient:
-    """Protocol-correct client for a fast-mcp upstream server.
-
-    Thread-safety: designed for single-event-loop use (asyncio). Do not share
-    across loops.
-    """
+    """Protocol-correct client for a fast-mcp upstream server."""
 
     def __init__(
         self,
@@ -99,31 +90,49 @@ class MCPClient:
         self._stack: AsyncExitStack | None = None
         self._lock = asyncio.Lock()
 
+        # Build auth provider from structured config, falling back to legacy fields.
+        if server.server_auth:
+            self._auth_provider: AuthProvider | None = build_auth_provider(server.server_auth)
+            self._forward_agent_header: str | None = server.server_auth.forward_agent_id_header
+        elif server.auth_header and server.auth_token:
+            from app.transport.auth_provider import StaticAuthProvider
+            self._auth_provider = StaticAuthProvider(server.auth_header, server.auth_token)
+            self._forward_agent_header = None
+        else:
+            self._auth_provider = None
+            self._forward_agent_header = None
+
+    # ---------- auth ----------
+
+    async def _resolve_headers(self, agent_id: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self._auth_provider is not None:
+            try:
+                headers.update(await self._auth_provider.get_headers(agent_id))
+            except AuthProviderError as exc:
+                raise UpstreamError(f"auth provider error: {exc}", code=-32002) from exc
+        if self._forward_agent_header and agent_id:
+            headers[self._forward_agent_header] = agent_id
+        return headers
+
     # ---------- session lifecycle ----------
 
-    async def _open_session(self) -> ClientSession:
+    async def _open_session(self, agent_id: str | None = None) -> ClientSession:
         stack = AsyncExitStack()
         url = str(self.server.base_url).rstrip("/")
         transport = self.server.transport
-
-        extra_headers: dict[str, str] = {}
-        if self.server.auth_header and self.server.auth_token:
-            extra_headers[self.server.auth_header] = self.server.auth_token
+        extra_headers = await self._resolve_headers(agent_id)
 
         if transport == "sse":
-            # Legacy MCP HTTP+SSE transport (spec 2024-11-05)
             sse_url = f"{url}/sse"
             read, write = await stack.enter_async_context(
                 sse_client(sse_url, headers=extra_headers)
             )
         else:
-            # Streamable HTTP (spec 2025-03-26) — fast-mcp 2.x default
+            # streamable-http (default, fast-mcp 2.x)
             mcp_url = f"{url}/mcp"
-            read, write, _get_session_id = await stack.enter_async_context(
-                streamable_http_client(
-                    mcp_url,
-                    http_client=self._http,
-                )
+            read, write, _ = await stack.enter_async_context(
+                streamable_http_client(mcp_url, http_client=self._http)
             )
 
         session = await stack.enter_async_context(ClientSession(read, write))
@@ -138,10 +147,10 @@ class MCPClient:
         )
         return session
 
-    async def _get_session(self) -> ClientSession:
+    async def _get_session(self, agent_id: str | None = None) -> ClientSession:
         async with self._lock:
             if self._session is None:
-                self._session = await self._open_session()
+                self._session = await self._open_session(agent_id)
         return self._session
 
     async def _reset_session(self) -> None:
@@ -157,7 +166,7 @@ class MCPClient:
     async def close(self) -> None:
         await self._reset_session()
 
-    # ---------- circuit-breaker gate ----------
+    # ---------- circuit-breaker ----------
 
     async def _gate(self) -> None:
         if self._cb is not None:
@@ -192,7 +201,6 @@ class MCPClient:
             ):
                 with attempt:
                     if attempt.retry_state.attempt_number > 1:
-                        # Session may be stale — reopen before retrying.
                         await self._reset_session()
                     session = await self._get_session()
                     result = await session.list_tools()
@@ -208,7 +216,9 @@ class MCPClient:
         await self._on_ok()
         return [_tool_to_dict(t) for t in tools]
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], *, agent_id: str | None = None
+    ) -> Any:
         await self._gate()
         try:
             async for attempt in AsyncRetrying(
@@ -222,7 +232,7 @@ class MCPClient:
                 with attempt:
                     if attempt.retry_state.attempt_number > 1:
                         await self._reset_session()
-                    session = await self._get_session()
+                    session = await self._get_session(agent_id)
                     result = await session.call_tool(name, arguments=arguments)
                     content = _extract_content(result)
         except UpstreamError:
@@ -234,11 +244,6 @@ class MCPClient:
             raise UpstreamError(str(exc)) from exc
 
         await self._on_ok()
-        log.debug(
-            "mcp.call_tool.ok",
-            server_id=self.server.id,
-            tool=name,
-        )
         return content
 
     async def ping(self) -> bool:
@@ -252,9 +257,9 @@ class MCPClient:
 
 
 def _tool_to_dict(t: Tool) -> dict[str, Any]:
-    """Convert an MCP Tool type to a plain dict our ToolDefinition understands."""
-    return {
-        "name": t.name,
-        "description": t.description or "",
-        "inputSchema": t.inputSchema if isinstance(t.inputSchema, dict) else t.inputSchema.model_dump(mode="json") if hasattr(t.inputSchema, "model_dump") else {},
-    }
+    schema = t.inputSchema
+    if hasattr(schema, "model_dump"):
+        schema = schema.model_dump(mode="json")
+    elif not isinstance(schema, dict):
+        schema = {}
+    return {"name": t.name, "description": t.description or "", "inputSchema": schema}

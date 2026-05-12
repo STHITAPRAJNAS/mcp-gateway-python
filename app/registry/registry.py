@@ -1,4 +1,22 @@
-"""Dynamic registry of upstream MCP servers."""
+"""Dynamic registry of upstream MCP servers.
+
+Tool naming
+-----------
+All tools are namespaced to prevent collisions when multiple upstreams expose
+identically-named tools. The `NamingConfig.strategy` controls this:
+
+  prefix_always     — <server_id>.<tool>  (default, unambiguous)
+  prefix_on_conflict — bare name when globally unique across all healthy
+                       servers; prefixed otherwise
+  bare              — no prefix; collision policy decides the outcome
+
+The `NamingConfig.on_conflict` policy fires when two tools would share the
+same qualified name:
+
+  warn   — log a warning; first-registered server wins (existing entry kept)
+  error  — raise ValueError; second registration is rejected
+  suffix — append _<server_id> to the later tool: search_internal
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +26,7 @@ from typing import Any
 
 import httpx
 
-from app.config import CircuitBreakerPolicy, UpstreamServer
+from app.config import CircuitBreakerPolicy, NamingConfig, UpstreamServer
 from app.models.mcp import ToolDefinition
 from app.observability.logging import get_logger
 from app.observability.metrics import REGISTERED_SERVERS, REGISTERED_TOOLS
@@ -28,13 +46,18 @@ class RegistryEntry:
     healthy: bool = False
 
 
+class ToolNameConflict(Exception):
+    pass
+
+
 class ServerRegistry:
-    def __init__(self, cb_policy: CircuitBreakerPolicy | None = None) -> None:
+    def __init__(
+        self,
+        cb_policy: CircuitBreakerPolicy | None = None,
+        naming: NamingConfig | None = None,
+    ) -> None:
         self._entries: dict[str, RegistryEntry] = {}
         self._lock = asyncio.Lock()
-        # Shared HTTP client for streamable-http transport connections.
-        # Each MCPClient opens its own MCP session but shares the underlying
-        # connection pool for efficiency.
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
@@ -46,6 +69,7 @@ class ServerRegistry:
             recovery_timeout=_cb_policy.recovery_timeout,
             probe_successes=_cb_policy.probe_successes,
         )
+        self._naming = naming or NamingConfig()
 
     # ------------- lifecycle -------------
 
@@ -104,25 +128,66 @@ class ServerRegistry:
         return [e for e in self._entries.values() if e.server.enabled]
 
     def find_by_qualified_tool(self, qualified_name: str) -> tuple[RegistryEntry, str] | None:
+        """Resolve a (possibly qualified) tool name to (entry, raw_tool_name).
+
+        Tries in order:
+          1. Exact match on ToolDefinition.qualified_name (covers all strategies).
+          2. Prefix split: "pg.list_tables" → prefix "pg".
+          3. Bare name — only succeeds when the name is unambiguous (exactly one
+             match); returns None for collisions so the caller gets a clean 404
+             rather than a random server.
+        """
+        # 1. Exact qualified_name match
+        for entry in self._entries.values():
+            for td in entry.tools:
+                if td.qualified_name == qualified_name:
+                    return entry, td.name
+
+        # 2. Prefix split (handles the common "server_id.tool_name" pattern)
         if "." in qualified_name:
             prefix, _, raw = qualified_name.partition(".")
             for entry in self._entries.values():
                 effective_prefix = entry.server.tool_prefix or entry.server.id
                 if effective_prefix == prefix:
                     return entry, raw
+
+        # 3. Bare name — must be globally unique
         matches = [
             (entry, qualified_name)
             for entry in self._entries.values()
-            if any(t.name == qualified_name for t in entry.tools)
+            for td in entry.tools
+            if td.name == qualified_name
         ]
         if len(matches) == 1:
             return matches[0]
+        if len(matches) > 1:
+            servers = [e.server.id for e, _ in matches]
+            log.warning(
+                "registry.ambiguous_tool",
+                tool=qualified_name,
+                servers=servers,
+                hint="use qualified name e.g. '{}.{}'".format(servers[0], qualified_name),
+            )
         return None
+
+    def list_conflicts(self) -> list[dict[str, Any]]:
+        """Return all bare tool names that appear in more than one server."""
+        seen: dict[str, list[str]] = {}
+        for entry in self._entries.values():
+            if not entry.server.enabled:
+                continue
+            for td in entry.tools:
+                seen.setdefault(td.name, []).append(entry.server.id)
+        return [
+            {"tool": name, "servers": sids}
+            for name, sids in seen.items()
+            if len(sids) > 1
+        ]
 
     def circuit_breaker_states(self) -> dict[str, dict]:
         return self._cb_registry.all_states()
 
-    # ------------- sync -------------
+    # ------------- sync & naming -------------
 
     async def sync_one(self, server_id: str) -> bool:
         entry = self._entries.get(server_id)
@@ -130,16 +195,7 @@ class ServerRegistry:
             return False
         try:
             raw_tools = await entry.client.list_tools()
-            prefix = entry.server.tool_prefix or entry.server.id
-            mutable_set = set(entry.server.mutable_tools)
-            tools: list[ToolDefinition] = []
-            for raw in raw_tools:
-                td = ToolDefinition.model_validate(raw)
-                td.server_id = entry.server.id
-                td.qualified_name = f"{prefix}.{td.name}"
-                td.mutable = td.name in mutable_set
-                td.tags = list(entry.server.tags)
-                tools.append(td)
+            tools = self._build_tool_definitions(entry, raw_tools)
             entry.tools = tools
             entry.healthy = True
             entry.last_error = None
@@ -152,9 +208,83 @@ class ServerRegistry:
         self._recompute_tool_count()
         return entry.healthy
 
+    def _build_tool_definitions(
+        self, entry: RegistryEntry, raw_tools: list[dict]
+    ) -> list[ToolDefinition]:
+        """Apply naming strategy and collision policy, returning ToolDefinitions."""
+        strategy = self._naming.strategy
+        on_conflict = self._naming.on_conflict
+        prefix = entry.server.tool_prefix or entry.server.id
+        mutable_set = set(entry.server.mutable_tools)
+
+        # Collect all qualified names already claimed by OTHER servers.
+        existing: dict[str, str] = {}  # qualified_name → server_id
+        for sid, other in self._entries.items():
+            if sid == entry.server.id:
+                continue
+            for td in other.tools:
+                if td.qualified_name:
+                    existing[td.qualified_name] = sid
+
+        tools: list[ToolDefinition] = []
+        for raw in raw_tools:
+            from app.models.mcp import ToolDefinition as TD
+            td = TD.model_validate(raw)
+            td.server_id = entry.server.id
+            td.mutable = td.name in mutable_set
+            td.tags = list(entry.server.tags)
+
+            # Decide the qualified name.
+            if strategy == "prefix_always":
+                qualified = f"{prefix}.{td.name}"
+            elif strategy == "bare":
+                qualified = td.name
+            else:  # prefix_on_conflict
+                bare = td.name
+                # Check if any other server also has this bare tool name.
+                collides = any(
+                    any(t.name == bare for t in other.tools)
+                    for sid, other in self._entries.items()
+                    if sid != entry.server.id
+                )
+                qualified = f"{prefix}.{bare}" if collides else bare
+
+            # Apply collision policy if the qualified name is already taken.
+            if qualified in existing:
+                owner = existing[qualified]
+                if on_conflict == "error":
+                    raise ToolNameConflict(
+                        f"tool '{qualified}' already registered by server '{owner}'; "
+                        f"cannot register from '{entry.server.id}'"
+                    )
+                elif on_conflict == "suffix":
+                    qualified = f"{qualified}_{entry.server.id}"
+                    log.warning(
+                        "registry.naming.conflict.suffix",
+                        original=f"{qualified}_{entry.server.id}",
+                        renamed=qualified,
+                        owner=owner,
+                        new_server=entry.server.id,
+                    )
+                else:  # warn — first wins
+                    log.warning(
+                        "registry.naming.conflict.skipped",
+                        tool=qualified,
+                        owner=owner,
+                        skipped=entry.server.id,
+                    )
+                    continue  # Don't add this tool; owner keeps it.
+
+            td.qualified_name = qualified
+            existing[qualified] = entry.server.id
+            tools.append(td)
+
+        return tools
+
     async def sync_all(self) -> None:
         await asyncio.gather(
-            *(self.sync_one(sid) for sid in list(self._entries)), return_exceptions=True
+            *(self.sync_one(sid) for sid in list(self._entries)),
+            return_exceptions=True,
         )
 
     def _recompute_tool_count(self) -> None:
@@ -175,6 +305,10 @@ class ServerRegistry:
                 "last_error": e.last_error,
                 "tags": e.server.tags,
                 "circuit_breaker": cb_states.get(sid, {}),
+                "auth_strategy": (
+                    e.server.server_auth.strategy if e.server.server_auth
+                    else ("static" if e.server.auth_header else "none")
+                ),
             }
             for sid, e in self._entries.items()
         }

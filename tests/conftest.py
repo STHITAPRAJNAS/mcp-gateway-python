@@ -39,7 +39,7 @@ class FakeClient:
     async def list_tools(self) -> list[dict[str, Any]]:
         return list(self._tools)
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(self, name: str, arguments: dict[str, Any], *, agent_id: str | None = None) -> Any:
         self.calls.append((name, arguments))
         if name in self._responses:
             value = self._responses[name]

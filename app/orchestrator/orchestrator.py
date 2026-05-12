@@ -167,7 +167,9 @@ class Orchestrator:
 
         start = time.perf_counter()
         try:
-            raw_result = await entry.client.call_tool(raw_tool, redacted_args)
+            raw_result = await entry.client.call_tool(
+                raw_tool, redacted_args, agent_id=principal.agent_id
+            )
         except UpstreamError as exc:
             elapsed = time.perf_counter() - start
             TOOL_CALL_LATENCY.labels(server_id=entry.server.id, tool=raw_tool).observe(elapsed)

@@ -33,7 +33,7 @@ from app.registry.registry import ServerRegistry
 def _build_components(
     cfg: GatewayConfig, settings: Settings
 ) -> tuple[ServerRegistry, Orchestrator, Authorizer, AuditStore]:
-    registry = ServerRegistry(cb_policy=cfg.circuit_breaker)
+    registry = ServerRegistry(cb_policy=cfg.circuit_breaker, naming=cfg.naming)
     authorizer = Authorizer(cfg.auth)
     redactor = Redactor(cfg.redaction)
     safety = SafetyFilter(cfg.guardrails)

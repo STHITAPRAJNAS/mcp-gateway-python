@@ -131,6 +131,21 @@ async def circuit_breaker_states(
     return {"circuit_breakers": registry.circuit_breaker_states()}
 
 
+@api_router.get("/v1/registry/conflicts", tags=["registry"])
+async def tool_name_conflicts(
+    registry: ServerRegistry = Depends(get_registry),
+) -> dict[str, Any]:
+    """List bare tool names that appear in more than one registered server.
+
+    Use this endpoint to detect naming collisions at runtime without having to
+    inspect each server's manifest manually. A non-empty list means the gateway
+    is relying on qualified names (e.g. 'pg.search') to disambiguate — bare
+    calls to those tool names will return 404.
+    """
+    conflicts = registry.list_conflicts()
+    return {"conflicts": conflicts, "count": len(conflicts)}
+
+
 # --- Tool manifest & calls ---
 
 @api_router.get("/v1/tools", response_model=ToolManifest, tags=["tools"])
