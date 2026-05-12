@@ -2,14 +2,14 @@ import pytest
 
 
 async def test_manifest_aggregates_all_servers(orchestrator):
-    manifest = orchestrator.build_manifest()
+    manifest = await orchestrator.build_manifest()
     names = {t.qualified_name for t in manifest.tools}
     assert names == {"pg.list_tables", "pg.execute_sql", "search.query"}
     assert manifest.server_count == 2
 
 
 async def test_manifest_tag_filter(orchestrator):
-    manifest = orchestrator.build_manifest(tag="search")
+    manifest = await orchestrator.build_manifest(tag="search")
     names = {t.qualified_name for t in manifest.tools}
     assert names == {"search.query"}
 

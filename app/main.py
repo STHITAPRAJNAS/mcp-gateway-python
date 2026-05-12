@@ -17,17 +17,21 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.admin.reload import install_sighup_handler
 from app.api.middleware import RequestContextMiddleware
 from app.api.routes import api_router, public_router
 from app.audit.store import AuditStore
+from app.cache.tool_cache import CacheConfig, ToolCache
 from app.config import GatewayConfig, Settings, get_settings
 from app.guardrails.safety import SafetyFilter
+from app.guardrails.schema_validator import ToolSchemaValidator
 from app.middleware.auth import Authorizer
 from app.middleware.ratelimit import RateLimiter, RateLimiterConfig
 from app.middleware.redaction import Redactor
 from app.observability.logging import configure_logging, get_logger
 from app.orchestrator.orchestrator import Orchestrator
 from app.registry.registry import ServerRegistry
+from app.webhooks.dispatcher import WebhookConfig, WebhookDispatcher
 
 
 def _build_components(
@@ -48,7 +52,27 @@ def _build_components(
     )
     rate_limiter = RateLimiter(rl_cfg)
     audit = AuditStore(settings.audit_db_url)
-    orchestrator = Orchestrator(registry, authorizer, redactor, safety, rate_limiter, audit)
+    schema_validator = ToolSchemaValidator(
+        enabled=cfg.schema_validation.enabled,
+        strict_on_missing_schema=cfg.schema_validation.strict_on_missing_schema,
+    )
+    cc = cfg.cache
+    cache = ToolCache(CacheConfig(
+        enabled=cc.enabled,
+        manifest_ttl=cc.manifest_ttl,
+        tool_results_enabled=cc.tool_results_enabled,
+        default_tool_ttl=cc.default_tool_ttl,
+        tool_ttls=dict(cc.tool_ttls),
+    ))
+    webhook_dispatcher = WebhookDispatcher([
+        WebhookConfig(**wh.model_dump()) for wh in cfg.webhooks
+    ])
+    orchestrator = Orchestrator(
+        registry, authorizer, redactor, safety, rate_limiter, audit,
+        schema_validator=schema_validator,
+        cache=cache,
+        webhook_dispatcher=webhook_dispatcher,
+    )
     return registry, orchestrator, authorizer, audit
 
 
@@ -81,6 +105,8 @@ async def lifespan(app: FastAPI):
     app.state.orchestrator = orchestrator
     app.state.authorizer = authorizer
     app.state.audit = audit
+
+    install_sighup_handler(app)
 
     # Start audit store (creates DB schema + background flush consumer).
     await audit.start()
@@ -118,6 +144,9 @@ async def lifespan(app: FastAPI):
                 pass
         await registry.close()
         await audit.stop()
+        dispatcher = getattr(orchestrator, "webhook_dispatcher", None)
+        if dispatcher is not None:
+            await dispatcher.close()
 
 
 def create_app() -> FastAPI:

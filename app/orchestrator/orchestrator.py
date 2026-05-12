@@ -1,12 +1,14 @@
-"""Orchestration layer: auth → rate limiting → guardrails → redaction → upstream → audit."""
+"""Orchestration layer: auth → rate limiting → guardrails → schema → cache → upstream → audit → webhooks."""
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.audit.store import AuditStore
+from app.cache.tool_cache import ToolCache
 from app.guardrails.safety import GuardrailViolation, SafetyFilter
+from app.guardrails.schema_validator import SchemaValidationError, ToolSchemaValidator
 from app.middleware.auth import AgentPrincipal, Authorizer, AuthorizationError
 from app.middleware.ratelimit import RateLimitExceeded, RateLimiter
 from app.middleware.redaction import Redactor
@@ -15,6 +17,10 @@ from app.observability.logging import get_logger, request_id_ctx
 from app.observability.metrics import TOOL_CALL_LATENCY, TOOL_CALLS_TOTAL
 from app.registry.registry import RegistryEntry, ServerRegistry
 from app.transport.mcp_client import UpstreamError
+from app.webhooks.dispatcher import WebhookDispatcher
+
+if TYPE_CHECKING:
+    pass
 
 log = get_logger("orchestrator")
 
@@ -34,6 +40,9 @@ class Orchestrator:
         safety: SafetyFilter,
         rate_limiter: RateLimiter | None = None,
         audit: AuditStore | None = None,
+        schema_validator: ToolSchemaValidator | None = None,
+        cache: ToolCache | None = None,
+        webhook_dispatcher: WebhookDispatcher | None = None,
     ) -> None:
         self.registry = registry
         self.authorizer = authorizer
@@ -41,10 +50,19 @@ class Orchestrator:
         self.safety = safety
         self.rate_limiter = rate_limiter
         self.audit = audit
+        self.schema_validator = schema_validator
+        self.cache = cache
+        self.webhook_dispatcher = webhook_dispatcher
 
     # --------- manifest ---------
 
-    def build_manifest(self, *, tag: str | None = None) -> ToolManifest:
+    async def build_manifest(self, *, tag: str | None = None) -> ToolManifest:
+        # Only use manifest cache when no tag filter is applied.
+        if tag is None and self.cache is not None:
+            cached = await self.cache.get_manifest()
+            if cached is not None:
+                return cached
+
         tools = []
         servers = 0
         for entry in self.registry.enabled_entries():
@@ -54,11 +72,16 @@ class Orchestrator:
                 continue
             servers += 1
             tools.extend(entry.tools)
-        return ToolManifest(
+        manifest = ToolManifest(
             tools=tools,
             generated_at=datetime.now(timezone.utc).isoformat(),
             server_count=servers,
         )
+
+        if tag is None and self.cache is not None:
+            await self.cache.set_manifest(manifest)
+
+        return manifest
 
     # --------- routing ---------
 
@@ -150,9 +173,38 @@ class Orchestrator:
                 server_id=entry.server.id, tool=raw_tool, status="guardrail_blocked"
             ).inc()
             _emit_audit(status="guardrail_blocked", is_error=True, error_detail=str(exc), guardrail_blocked=True)
+            if self.webhook_dispatcher is not None:
+                self.webhook_dispatcher.dispatch("guardrail_block", {
+                    "agent_id": principal.agent_id,
+                    "server_id": entry.server.id,
+                    "tool": raw_tool,
+                    "reason": str(exc),
+                })
             raise OrchestrationError(str(exc), code=422) from exc
 
-        # 4) Redact request
+        # 4) JSON Schema validation
+        if self.schema_validator is not None:
+            tool_def = next(
+                (t for t in entry.tools if t.name == qualified or t.name == raw_tool), None
+            )
+            input_schema = tool_def.input_schema if tool_def else None
+            try:
+                self.schema_validator.validate(raw_tool, arguments, input_schema)
+            except SchemaValidationError as exc:
+                TOOL_CALLS_TOTAL.labels(
+                    server_id=entry.server.id, tool=raw_tool, status="schema_invalid"
+                ).inc()
+                _emit_audit(status="schema_invalid", is_error=True, error_detail=str(exc))
+                if self.webhook_dispatcher is not None:
+                    self.webhook_dispatcher.dispatch("schema_invalid", {
+                        "agent_id": principal.agent_id,
+                        "server_id": entry.server.id,
+                        "tool": raw_tool,
+                        "errors": exc.field_errors,
+                    })
+                raise OrchestrationError(str(exc), code=422) from exc
+
+        # 5) Redact request
         redacted_args, req_redacted = self.redactor.redact(arguments, direction="request")
 
         log.info(
@@ -164,6 +216,21 @@ class Orchestrator:
             mutable=mutable,
             request_redacted=req_redacted,
         )
+
+        # 6) Cache lookup (skip for mutable tools)
+        if self.cache is not None and not mutable:
+            cached_result = await self.cache.get_result(qualified, redacted_args)
+            if cached_result is not None:
+                log.debug("tool.call.cache_hit", tool=raw_tool, qualified=qualified)
+                return ToolCallResult(
+                    server_id=entry.server.id,
+                    tool=raw_tool,
+                    content=cached_result,
+                    is_error=False,
+                    latency_ms=0.0,
+                    redacted=req_redacted,
+                    cached=True,
+                )
 
         start = time.perf_counter()
         try:
@@ -184,6 +251,14 @@ class Orchestrator:
                 error=str(exc),
             )
             _emit_audit(status="upstream_error", is_error=True, error_detail=str(exc), latency_ms=round(elapsed * 1000, 2))
+            if self.webhook_dispatcher is not None:
+                self.webhook_dispatcher.dispatch("tool_call_error", {
+                    "agent_id": principal.agent_id,
+                    "server_id": entry.server.id,
+                    "tool": raw_tool,
+                    "error": str(exc),
+                    "latency_ms": round(elapsed * 1000, 2),
+                })
             raise OrchestrationError(f"upstream error: {exc}", code=502) from exc
         except Exception as exc:  # noqa: BLE001
             elapsed = time.perf_counter() - start
@@ -193,15 +268,27 @@ class Orchestrator:
             ).inc()
             log.exception("tool.call.error", server_id=entry.server.id, tool=raw_tool)
             _emit_audit(status="error", is_error=True, error_detail=str(exc), latency_ms=round(elapsed * 1000, 2))
+            if self.webhook_dispatcher is not None:
+                self.webhook_dispatcher.dispatch("tool_call_error", {
+                    "agent_id": principal.agent_id,
+                    "server_id": entry.server.id,
+                    "tool": raw_tool,
+                    "error": str(exc),
+                    "latency_ms": round(elapsed * 1000, 2),
+                })
             raise OrchestrationError(str(exc), code=500) from exc
 
         elapsed = time.perf_counter() - start
         TOOL_CALL_LATENCY.labels(server_id=entry.server.id, tool=raw_tool).observe(elapsed)
         TOOL_CALLS_TOTAL.labels(server_id=entry.server.id, tool=raw_tool, status="ok").inc()
 
-        # 5) Redact response
+        # 7) Redact response
         clean, resp_redacted = self.redactor.redact(raw_result, direction="response")
         was_redacted = req_redacted or resp_redacted
+
+        # 8) Store result in cache (skip mutable tools)
+        if self.cache is not None and not mutable:
+            await self.cache.set_result(qualified, redacted_args, clean)
 
         log.info(
             "tool.call.ok",
@@ -217,6 +304,14 @@ class Orchestrator:
             redacted=was_redacted,
         )
 
+        if self.webhook_dispatcher is not None:
+            self.webhook_dispatcher.dispatch("tool_call_ok", {
+                "agent_id": principal.agent_id,
+                "server_id": entry.server.id,
+                "tool": raw_tool,
+                "latency_ms": round(elapsed * 1000, 2),
+            })
+
         return ToolCallResult(
             server_id=entry.server.id,
             tool=raw_tool,
@@ -224,4 +319,5 @@ class Orchestrator:
             is_error=False,
             latency_ms=round(elapsed * 1000, 2),
             redacted=was_redacted,
+            cached=False,
         )

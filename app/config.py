@@ -145,6 +145,27 @@ class CircuitBreakerPolicy(BaseModel):
     probe_successes: int = 2
 
 
+class SchemaValidationConfig(BaseModel):
+    enabled: bool = True
+    strict_on_missing_schema: bool = False
+
+
+class CacheConfig(BaseModel):
+    enabled: bool = True
+    manifest_ttl: float = 60.0
+    tool_results_enabled: bool = True
+    default_tool_ttl: float = 0.0
+    tool_ttls: dict[str, float] = Field(default_factory=dict)
+
+
+class WebhookConfig(BaseModel):
+    url: str
+    secret_env: str | None = None
+    events: list[str] = Field(default_factory=list)
+    timeout: float = 5.0
+    max_retries: int = 3
+
+
 # ---------- root config ----------
 
 class GatewayConfig(BaseModel):
@@ -155,6 +176,9 @@ class GatewayConfig(BaseModel):
     rate_limiting: RateLimitingPolicy = RateLimitingPolicy()
     circuit_breaker: CircuitBreakerPolicy = CircuitBreakerPolicy()
     naming: NamingConfig = NamingConfig()
+    schema_validation: SchemaValidationConfig = SchemaValidationConfig()
+    cache: CacheConfig = CacheConfig()
+    webhooks: list[WebhookConfig] = Field(default_factory=list)
 
     @field_validator("upstreams")
     @classmethod

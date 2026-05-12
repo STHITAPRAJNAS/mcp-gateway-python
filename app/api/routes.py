@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sse_starlette.sse import EventSourceResponse
@@ -153,7 +153,7 @@ async def list_tools(
     tag: str | None = Query(default=None, description="Optional tag filter"),
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ) -> ToolManifest:
-    return orchestrator.build_manifest(tag=tag)
+    return await orchestrator.build_manifest(tag=tag)
 
 
 @api_router.post("/v1/tools/call", response_model=ToolCallResult, tags=["tools"])
@@ -221,6 +221,20 @@ async def call_tool_stream(
         ping=15,
         headers={"X-Gateway-Timeout": str(settings.request_timeout_seconds)},
     )
+
+
+# --- Admin ---
+
+@api_router.post("/v1/admin/reload", tags=["admin"])
+async def hot_reload(request: Request) -> dict[str, Any]:
+    """Hot-reload gateway.yaml without restarting.
+
+    Swaps upstreams, auth, redaction, guardrails, rate limiting, circuit
+    breaker, schema validation, cache, and webhook config at runtime.
+    Active MCP sessions to unchanged upstreams are preserved.
+    """
+    from app.admin.reload import _do_reload
+    return await _do_reload(request.app)
 
 
 # --- Audit log ---

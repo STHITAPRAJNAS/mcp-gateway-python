@@ -75,6 +75,7 @@ class ToolCallResult(BaseModel):
     is_error: bool = False
     latency_ms: float = 0.0
     redacted: bool = False
+    cached: bool = False
 
 
 class HealthResponse(BaseModel):
