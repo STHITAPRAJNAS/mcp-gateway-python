@@ -32,8 +32,11 @@ class ServerRegistry:
     def __init__(self, cb_policy: CircuitBreakerPolicy | None = None) -> None:
         self._entries: dict[str, RegistryEntry] = {}
         self._lock = asyncio.Lock()
+        # Shared HTTP client for streamable-http transport connections.
+        # Each MCPClient opens its own MCP session but shares the underlying
+        # connection pool for efficiency.
         self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0),
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
         )
         _cb_policy = cb_policy or CircuitBreakerPolicy()
